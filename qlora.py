@@ -43,7 +43,6 @@ from peft import (
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
-
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
         return str(version.parse(full_version).major) + "." + str(version.parse(full_version).minor)
@@ -133,26 +132,6 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     train_on_source: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether to train on the input in addition to the target text."}
-    )
-    mmlu_split: Optional[str] = field(
-        default='eval',
-        metadata={"help": "The MMLU split to run on"}
-    )
-    mmlu_dataset: Optional[str] = field(
-        default='mmlu-fs',
-        metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
-    )
-    do_mmlu_eval: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to run the MMLU evaluation."}
-    )
-    max_mmlu_samples: Optional[int] = field(
-        default=None,
-        metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
-    )
-    mmlu_source_max_len: int = field(
-        default=2048,
-        metadata={"help": "Maximum source sequence length for mmlu."}
     )
     full_finetune: bool = field(
         default=False,
@@ -365,11 +344,11 @@ def get_accelerate_model(args, checkpoint_dir):
         # Note that these are present in the vocabulary.
         # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
         print('Adding special tokens.')
+        tokenizer.pad_token='[PAD]'
+        tokenizer.unk_token = '[PAD]'
         tokenizer.add_special_tokens({
-                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
-                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
                 "unk_token": tokenizer.convert_ids_to_tokens(
-                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
+                    tokenizer.pad_token_id
                 ),
         })
     
@@ -497,42 +476,6 @@ class DataCollatorForCausalLM(object):
             data_dict['labels'] = labels
         return data_dict
 
-def extract_unnatural_instructions_data(examples, extract_reformulations=False):
-    out = {
-        'input': [],
-        'output': [],
-    }
-    for example_instances in examples['instances']:
-        for instance in example_instances:
-            out['input'].append(instance['instruction_with_input'])
-            out['output'].append(instance['output'])
-    if extract_reformulations:
-        for example_reformulations in examples['reformulations']:
-            if example_reformulations is not None:
-                for instance in example_reformulations:
-                    out['input'].append(instance['instruction_with_input'])
-                    out['output'].append(instance['output'])
-    return out
-
-ALPACA_PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response: "
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response: "
-    ),
-}
-
-def extract_alpaca_dataset(example):
-    if example.get("input", "") != "":
-        prompt_format = ALPACA_PROMPT_DICT["prompt_input"]
-    else:
-        prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
-    return {'input': prompt_format.format(**example)}
 
 def local_dataset(dataset_name):
     if dataset_name.endswith('.json') or dataset_name.endswith('.jsonl'):
@@ -586,6 +529,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             return load_dataset("akoksal/LongForm")
         elif dataset_name == 'oasst1':
             return load_dataset("timdettmers/openassistant-guanaco")
+        elif "code" in dataset_name:
+            return load_dataset(dataset_name)
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         else:
@@ -623,6 +568,37 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                 'input': '',
                 'output': x['text'],
             })
+        elif dataset_format == 'direct_code_edit':
+            instruction= "Revise the provided code to solve the described problem correctly." 
+            dataset = dataset.map(lambda x: {
+                "input": f"{instruction}\nProblem Description:{x['description']}\nIncorrect Code:\n{x['wrong_code']}",
+                "output": f"Correct code:\n{x['correct_code']}"
+            })
+            if not os.path.isdir(args.output_dir):
+                os.mkdir(args.output_dir)
+            with open(os.path.join(args.output_dir, "input_output_format.json"), "w") as f:
+                input_sample = dataset["train"][0]['input']
+                output_sample = dataset["train"][0]['output']
+                json.dump({
+                    "input": input_sample,
+                    "output": output_sample
+                }, f, indent=4)
+        elif dataset_format == 'feedback_code_edit':
+            instruction= "Provide feedback on the errors in the given code and suggest the correct code to address the described problem."
+
+            dataset = dataset.map(lambda x: {
+                "input": f"{instruction}\nProblem Description:{x['description']}\nIncorrect Code:\n{x['wrong_code']}\n",
+                "output": f"Feedback:\n{x['prediction']}\nCorrect code:\n{x['correct_code']}"
+            })
+            if not os.path.isdir(args.output_dir):
+                os.mkdir(args.output_dir)
+            with open(os.path.join(args.output_dir, "input_output_format.json"), "w") as f:
+                input_sample = dataset["train"][0]['input']
+                output_sample = dataset["train"][0]['output']
+                json.dump({
+                    "input": input_sample,
+                    "output": output_sample
+                },f, indent=4)
         elif dataset_format == 'input-output':
             # leave as is
             pass
@@ -719,69 +695,7 @@ def train():
     # Callbacks
     if not args.full_finetune:
         trainer.add_callback(SavePeftModelCallback)
-    if args.do_mmlu_eval:
-        if args.mmlu_dataset == 'mmlu-zs':
-            mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'data/mmlu/zero_shot_mmlu_val.json',
-                'test': 'data/mmlu/zero_shot_mmlu_test.json',
-            })
-            mmlu_dataset = mmlu_dataset.remove_columns('subject')
-        # MMLU Five-shot (Eval/Test only)
-        elif args.mmlu_dataset == 'mmlu' or args.mmlu_dataset == 'mmlu-fs':
-            mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'data/mmlu/five_shot_mmlu_val.json',
-                'test': 'data/mmlu/five_shot_mmlu_test.json',
-            })
-            # mmlu_dataset = mmlu_dataset.remove_columns('subject')
-        mmlu_dataset = mmlu_dataset[args.mmlu_split]
-        if args.max_mmlu_samples is not None:
-            mmlu_dataset = mmlu_dataset.select(range(args.max_mmlu_samples))
-        abcd_idx = [
-            tokenizer("A", add_special_tokens=False).input_ids[0],
-            tokenizer("B", add_special_tokens=False).input_ids[0],
-            tokenizer("C", add_special_tokens=False).input_ids[0],
-            tokenizer("D", add_special_tokens=False).input_ids[0],
-        ]
-        accuracy = evaluate.load("accuracy")
-        class MMLUEvalCallback(transformers.TrainerCallback):
-            def on_evaluate(self, args, state, control, model, **kwargs):
-                data_loader = trainer.get_eval_dataloader(mmlu_dataset)
-                source_max_len = trainer.data_collator.source_max_len
-                trainer.data_collator.source_max_len = args.mmlu_source_max_len
-                trainer.model.eval()
-                preds, refs = [], []
-                loss_mmlu = 0
-                for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
-                    # There are two tokens, the output, and eos token.
-                    for i, logit in enumerate(logits):
-                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
-                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
-                        preds.append(torch.argmax(logit_abcd).item())
-                    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
-                    refs += [abcd_idx.index(label) for label in labels.tolist()]
-                    loss_mmlu += loss.item()
-                # Extract results by subject.
-                results = {'mmlu_loss':loss_mmlu/len(data_loader)}
-                subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
-                for s,p,r in zip(subject, preds, refs):
-                    subjects[s]['preds'].append(p)
-                    subjects[s]['refs'].append(r)
-                subject_scores = []
-                for subject in subjects:
-                    subject_score = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds']
-                    )['accuracy']
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
-                    subject_scores.append(subject_score)
-                results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
-                trainer.log(results)
-                trainer.data_collator.source_max_len = source_max_len
-
-        trainer.add_callback(MMLUEvalCallback)
-
+   
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)
     dtypes = {}
